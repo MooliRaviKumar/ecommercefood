@@ -1,140 +1,142 @@
-# accounts/views.py
-from rest_framework import viewsets
-from .models import User
-from .serializers import UserSerializer
-from rest_framework.permissions import IsAuthenticated
-from rest_framework_simplejwt.views import TokenObtainPairView
-from accounts.authentication import CustomJWTAuthentication
+import uuid
+from datetime import datetime, timedelta, timezone
+
 import jwt
 from django.conf import settings
-from datetime import datetime, timedelta
+from django.contrib.auth import authenticate, get_user_model
+from rest_framework import permissions, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.response import Response
-from rest_framework.decorators import api_view
-from django.shortcuts import render, redirect
-# accounts/views.py
-from django.contrib.auth import get_user_model
-from django.shortcuts import render, redirect
-from django.contrib import messages
-from django.views.decorators.csrf import csrf_exempt
-from django.http import JsonResponse
-from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework import status
-import uuid
+
+from .models import BlacklistedRefreshToken, Profile
+from .permissions import IsOwnerProfileOrAdmin, IsSelfOrAdmin
+from .serializers import ProfileSerializer, SignupSerializer, UserSerializer
 
 User = get_user_model()
 
 
+# ── JWT helpers ───────────────────────────────────────────
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _encode(payload):
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm="HS256")
+
+
+def make_access_token(user):
+    payload = {
+        "jti": str(uuid.uuid4()),
+        "type": "access",
+        "user_id": user.id,
+        "role": user.role,
+        "iat": int(_now().timestamp()),
+        "exp": int((_now() + timedelta(minutes=20)).timestamp()),  # 20min
+    }
+    return _encode(payload)
+
+
+def make_refresh_token(user):
+    jti = str(uuid.uuid4())
+    payload = {
+        "jti": jti,
+        "type": "refresh",
+        "user_id": user.id,
+        "iat": int(_now().timestamp()),
+        "exp": int((_now() + timedelta(days=7)).timestamp()),  # 7d
+    }
+    return {"token": _encode(payload), "jti": jti}
+
+
+def decode_token(token):
+    return jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+
+
+# ── User ViewSet ─────────────────────────────────────────
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all()
     serializer_class = UserSerializer
-    authentication_classes = [CustomJWTAuthentication]  
+    permission_classes = [permissions.IsAuthenticated, IsSelfOrAdmin]
 
-    permission_classes = [IsAuthenticated]
+    def get_serializer_class(self):
+        if self.action == "create":
+            return SignupSerializer
+        return UserSerializer
 
-@api_view(['POST'])
-def login_view(request):
-    username = request.data.get('username')
-    password = request.data.get('password')
-    
-    try:
-        user = User.objects.get(username=username)
-        if not user.check_password(password):
-            return Response({
-                "error": "Invalid credentials"
-            }, status=status.HTTP_401_UNAUTHORIZED)
-        
-        # Generate token with jti claim
-        refresh = RefreshToken.for_user(user)
-        refresh.set_jti()
-        
-        return Response({
-            'access': str(refresh.access_token),
-            'refresh': str(refresh),
-            'user': {
-                'username': user.username,
-                'email': user.email,
-                'role': user.role
-            }
-        }, status=status.HTTP_200_OK)
-        
-    except User.DoesNotExist:
-        return Response({
-            "error": "User not found"
-        }, status=status.HTTP_404_NOT_FOUND)
+    def get_permissions(self):
+        if self.action in ["create", "login"]:
+            return [permissions.AllowAny()]
+        return super().get_permissions()
 
-@api_view(['POST'])
-def refresh_token_view(request):
-    refresh_token = request.data.get("refresh_token")
-    if not refresh_token:
-        return Response({"error": "Refresh token required"}, status=400)
+    # signup = POST /api/users/
+    # login = POST /api/users/login/
+    @action(detail=False, methods=["post"], permission_classes=[permissions.AllowAny])
+    def login(self, request):
+        identifier = request.data.get("username")
+        password = request.data.get("password")
 
-    try:
-        payload = jwt.decode(refresh_token, settings.SECRET_KEY, algorithms=["HS256"])
-        user = User.objects.get(id=payload["user_id"])
-    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError, User.DoesNotExist):
-        return Response({"error": "Invalid or expired refresh token"}, status=401)
+        # allow login with email or username
+        if "@" in identifier:
+            try:
+                identifier = User.objects.get(email__iexact=identifier).username
+            except User.DoesNotExist:
+                pass
 
-    # Issue new access token (20 min)
-    access_payload = {
-        "user_id": user.id,
-        "exp": datetime.utcnow() + timedelta(minutes=20)
-    }
-    access_token = jwt.encode(access_payload, settings.SECRET_KEY, algorithm="HS256")
+        user = authenticate(username=identifier, password=password)
+        if not user:
+            raise AuthenticationFailed("Invalid credentials")
 
-    return Response({"access_token": access_token})
+        access = make_access_token(user)
+        refresh = make_refresh_token(user)["token"]
 
-@csrf_exempt
-def register_user(request):
-    if request.method == "POST":
-        import json
-        body = json.loads(request.body.decode('utf-8'))  # read JSON payload
-
-        username = body.get("username")
-        email = body.get("email")
-        password = body.get("password")
-        role = body.get("role", "customer")
-        profile_image_url = body.get("profile_image_url", "")
-
-        if User.objects.filter(username=username).exists():
-            return JsonResponse({"error": "Username already exists"}, status=400)
-
-        User.objects.create_user(
-            username=username,
-            email=email,
-            password=password,
-            role=role,
-            profile_image_url=profile_image_url
+        return Response(
+            {"user": UserSerializer(user).data, "access": access, "refresh": refresh}
         )
 
-        return JsonResponse({"message": "User registered successfully!"}, status=201)
+    @action(detail=False, methods=["post"], permission_classes=[permissions.AllowAny])
+    def refresh(self, request):
+        token = request.data.get("refresh")
+        if not token:
+            return Response({"detail": "refresh required"}, status=400)
+        try:
+            payload = decode_token(token)
+        except jwt.ExpiredSignatureError:
+            return Response({"detail": "refresh expired"}, status=401)
+        except jwt.InvalidTokenError:
+            return Response({"detail": "invalid refresh"}, status=401)
 
-    return JsonResponse({"error": "Invalid request"}, status=400)
+        if payload.get("type") != "refresh":
+            return Response({"detail": "wrong token type"}, status=401)
 
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def logout_view(request):
-    try:
-        refresh_token = request.data.get("refresh_token")
-        if not refresh_token:
-            return Response({"error": "Refresh token required"}, status=status.HTTP_400_BAD_REQUEST)
+        jti = payload.get("jti")
+        if BlacklistedRefreshToken.objects.filter(jti=jti).exists():
+            return Response({"detail": "refresh revoked"}, status=401)
+        BlacklistedRefreshToken.objects.create(jti=jti)
 
-        # Create token with verify=False to avoid immediate verification
-        token = RefreshToken(refresh_token, verify=False)
-        
-        # Add jti claim if missing
-        if 'jti' not in token:
-            token.set_jti()
-            
-        # Now verify and blacklist
-        token.verify()
-        token.blacklist()
-        
-        return Response({
-            "message": "Logged out successfully"
-        }, status=status.HTTP_200_OK)
-        
-    except Exception as e:
-        return Response({
-            "error": f"Invalid or expired token: {str(e)}"
-        }, status=status.HTTP_400_BAD_REQUEST)
+        user = User.objects.get(id=payload["user_id"])
+        new_access = make_access_token(user)
+        new_refresh = make_refresh_token(user)
+        return Response({"access": new_access, "refresh": new_refresh["token"]})
+
+    @action(detail=False, methods=["post"])
+    def logout(self, request):
+        token = request.data.get("refresh")
+        if not token:
+            return Response({"detail": "refresh required"}, status=400)
+        try:
+            payload = decode_token(token)
+            if payload.get("type") == "refresh":
+                jti = payload.get("jti")
+                if not BlacklistedRefreshToken.objects.filter(jti=jti).exists():
+                    BlacklistedRefreshToken.objects.create(jti=jti)
+        except jwt.InvalidTokenError:
+            pass
+        return Response(status=status.HTTP_205_RESET_CONTENT)
+
+
+# ── Profile ViewSet ──────────────────────────────────────
+class ProfileViewSet(viewsets.ModelViewSet):
+    queryset = Profile.objects.all()
+    serializer_class = ProfileSerializer
+    permission_classes = [permissions.IsAuthenticated, IsOwnerProfileOrAdmin]
